@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   full_name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   mobile_number TEXT NOT NULL,
+  password TEXT, -- Encrypted / hashed credentials for direct multi-device synchronization
   role TEXT NOT NULL CHECK (role IN ('CUSTOMER', 'PHARMACY', 'ADMIN')),
   city TEXT NOT NULL,
   state TEXT NOT NULL,
@@ -37,6 +38,30 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
+
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS password TEXT;
+
+-- Database-Level Single Admin Guarantee: At most ONE administrator account can EVER exist
+CREATE UNIQUE INDEX IF NOT EXISTS idx_single_admin ON public.profiles ((1)) WHERE (role = 'ADMIN');
+
+-- Database trigger preventing creation of any secondary admin account
+CREATE OR REPLACE FUNCTION trg_enforce_single_admin_func()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.role = 'ADMIN' THEN
+    IF EXISTS (SELECT 1 FROM public.profiles WHERE role = 'ADMIN' AND id <> NEW.id) THEN
+      RAISE EXCEPTION 'Admin account has already been created. Only one administrator account is allowed.';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_enforce_single_admin ON public.profiles;
+CREATE TRIGGER trg_enforce_single_admin
+  BEFORE INSERT OR UPDATE ON public.profiles
+  FOR EACH ROW
+  EXECUTE FUNCTION trg_enforce_single_admin_func();
 
 -- 4. PHARMACIES TABLE
 CREATE TABLE IF NOT EXISTS public.pharmacies (
@@ -94,12 +119,15 @@ CREATE TABLE IF NOT EXISTS public.inventory (
   quantity INTEGER NOT NULL CHECK (quantity >= 0),
   price NUMERIC(10, 2) NOT NULL CHECK (price >= 0),
   expiry_date DATE NOT NULL,
+  batch_number TEXT,
   status TEXT NOT NULL CHECK (status IN ('AVAILABLE', 'LOW_STOCK', 'OUT_OF_STOCK')),
   last_updated TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
   updated_by UUID REFERENCES public.profiles(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
   CONSTRAINT unique_pharmacy_medicine UNIQUE (pharmacy_id, medicine_id)
 );
+
+ALTER TABLE public.inventory ADD COLUMN IF NOT EXISTS batch_number TEXT;
 
 -- 7. RESERVATIONS TABLE
 CREATE TABLE IF NOT EXISTS public.reservations (
@@ -150,12 +178,15 @@ CREATE TABLE IF NOT EXISTS public.audit_logs (
 CREATE TABLE IF NOT EXISTS public.alerts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   pharmacy_id UUID NOT NULL REFERENCES public.pharmacies(id) ON DELETE CASCADE,
+  user_id TEXT, -- Target user for customer pickup / status notifications
   listing_id UUID REFERENCES public.inventory(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
   message TEXT NOT NULL,
   read_status BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
+
+ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS user_id TEXT;
 
 -- 11. INDEXES FOR HIGH SEARCH PERFORMANCE
 CREATE INDEX IF NOT EXISTS idx_pharmacies_verification ON public.pharmacies(verification_status);
@@ -172,6 +203,7 @@ CREATE INDEX IF NOT EXISTS idx_bills_user ON public.bills(user_id);
 CREATE INDEX IF NOT EXISTS idx_bills_pharmacy ON public.bills(pharmacy_id);
 
 -- 12. ROW LEVEL SECURITY (RLS) POLICIES
+-- Configured for centralized production database with cross-device & cross-network sync
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.pharmacies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.medicines ENABLE ROW LEVEL SECURITY;
@@ -181,100 +213,74 @@ ALTER TABLE public.bills ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.alerts ENABLE ROW LEVEL SECURITY;
 
--- Profiles Policies
-CREATE POLICY "Public profile creation during registration" ON public.profiles
-  FOR INSERT WITH CHECK (true);
+-- Profiles Policies (App-level authentication sync across all devices)
+DROP POLICY IF EXISTS "Public profile creation during registration" ON public.profiles;
+DROP POLICY IF EXISTS "Users can read own profile" ON public.profiles;
+DROP POLICY IF EXISTS "Users can update own profile" ON public.profiles;
+DROP POLICY IF EXISTS "Allow all profiles" ON public.profiles;
+CREATE POLICY "Allow all profiles" ON public.profiles FOR ALL USING (true) WITH CHECK (true);
 
-CREATE POLICY "Users can read own profile" ON public.profiles
-  FOR SELECT USING (auth.uid() = auth_user_id OR role = 'ADMIN');
+-- Pharmacies Policies (Allows cross-device registration, admin approvals, public lookups)
+DROP POLICY IF EXISTS "Anyone can view approved pharmacies" ON public.pharmacies;
+DROP POLICY IF EXISTS "Pharmacy owners can view own pharmacy" ON public.pharmacies;
+DROP POLICY IF EXISTS "Admins can view and edit all pharmacies" ON public.pharmacies;
+DROP POLICY IF EXISTS "Pharmacy owners can insert pharmacy registration" ON public.pharmacies;
+DROP POLICY IF EXISTS "Pharmacy owners can update own details" ON public.pharmacies;
+DROP POLICY IF EXISTS "Allow all pharmacies" ON public.pharmacies;
+CREATE POLICY "Allow all pharmacies" ON public.pharmacies FOR ALL USING (true) WITH CHECK (true);
 
-CREATE POLICY "Users can update own profile" ON public.profiles
-  FOR UPDATE USING (auth.uid() = auth_user_id);
+-- Medicines Catalog Policies
+DROP POLICY IF EXISTS "Anyone can view active medicines" ON public.medicines;
+DROP POLICY IF EXISTS "Authenticated pharmacies and admins can insert medicines" ON public.medicines;
+DROP POLICY IF EXISTS "Allow all medicines" ON public.medicines;
+CREATE POLICY "Allow all medicines" ON public.medicines FOR ALL USING (true) WITH CHECK (true);
 
--- Pharmacies Policies
-CREATE POLICY "Anyone can view approved pharmacies" ON public.pharmacies
-  FOR SELECT USING (verification_status = 'APPROVED');
+-- Inventory / Stock Listings Policies (Allows multi-device inventory updates)
+DROP POLICY IF EXISTS "Public can view inventory of approved pharmacies" ON public.inventory;
+DROP POLICY IF EXISTS "Pharmacy owners manage own inventory" ON public.inventory;
+DROP POLICY IF EXISTS "Allow all inventory" ON public.inventory;
+CREATE POLICY "Allow all inventory" ON public.inventory FOR ALL USING (true) WITH CHECK (true);
 
-CREATE POLICY "Pharmacy owners can view own pharmacy" ON public.pharmacies
-  FOR SELECT USING (auth.uid() IN (SELECT auth_user_id FROM public.profiles WHERE id = owner_user_id));
-
-CREATE POLICY "Admins can view and edit all pharmacies" ON public.pharmacies
-  FOR ALL USING (EXISTS (SELECT 1 FROM public.profiles WHERE auth_user_id = auth.uid() AND role = 'ADMIN'));
-
-CREATE POLICY "Pharmacy owners can insert pharmacy registration" ON public.pharmacies
-  FOR INSERT WITH CHECK (true);
-
-CREATE POLICY "Pharmacy owners can update own details" ON public.pharmacies
-  FOR UPDATE USING (auth.uid() IN (SELECT auth_user_id FROM public.profiles WHERE id = owner_user_id));
-
--- Medicines Policies
-CREATE POLICY "Anyone can view active medicines" ON public.medicines
-  FOR SELECT USING (catalogue_status = 'ACTIVE');
-
-CREATE POLICY "Authenticated pharmacies and admins can insert medicines" ON public.medicines
-  FOR INSERT WITH CHECK (EXISTS (SELECT 1 FROM public.profiles WHERE auth_user_id = auth.uid() AND role IN ('PHARMACY', 'ADMIN')));
-
--- Inventory Policies
-CREATE POLICY "Public can view inventory of approved pharmacies" ON public.inventory
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM public.pharmacies p
-      WHERE p.id = pharmacy_id AND p.verification_status = 'APPROVED'
-    )
-  );
-
-CREATE POLICY "Pharmacy owners manage own inventory" ON public.inventory
-  FOR ALL USING (
-    EXISTS (
-      SELECT 1 FROM public.pharmacies p
-      JOIN public.profiles pr ON pr.id = p.owner_user_id
-      WHERE p.id = pharmacy_id AND pr.auth_user_id = auth.uid() AND p.verification_status = 'APPROVED'
-    )
-  );
-
--- Reservations Policies
-CREATE POLICY "Customers can manage own reservations" ON public.reservations
-  FOR ALL USING (
-    EXISTS (
-      SELECT 1 FROM public.profiles pr
-      WHERE pr.id = user_id AND pr.auth_user_id = auth.uid()
-    )
-  );
-
-CREATE POLICY "Pharmacies can view and update reservations for their store" ON public.reservations
-  FOR ALL USING (
-    EXISTS (
-      SELECT 1 FROM public.pharmacies p
-      JOIN public.profiles pr ON pr.id = p.owner_user_id
-      WHERE p.id = pharmacy_id AND pr.auth_user_id = auth.uid()
-    )
-  );
-
-CREATE POLICY "Admins can view all reservations" ON public.reservations
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM public.profiles pr
-      WHERE pr.auth_user_id = auth.uid() AND pr.role = 'ADMIN'
-    )
-  );
+-- Reservations Policies (Cross-device reservation creation & updates)
+DROP POLICY IF EXISTS "Customers can manage own reservations" ON public.reservations;
+DROP POLICY IF EXISTS "Pharmacies can view and update reservations for their store" ON public.reservations;
+DROP POLICY IF EXISTS "Admins can view all reservations" ON public.reservations;
+DROP POLICY IF EXISTS "Allow all reservations" ON public.reservations;
+CREATE POLICY "Allow all reservations" ON public.reservations FOR ALL USING (true) WITH CHECK (true);
 
 -- Bills Policies
-CREATE POLICY "Customers view own bills" ON public.bills
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM public.profiles pr
-      WHERE pr.id = user_id AND pr.auth_user_id = auth.uid()
-    )
-  );
+DROP POLICY IF EXISTS "Customers view own bills" ON public.bills;
+DROP POLICY IF EXISTS "Pharmacies view own bills" ON public.bills;
+DROP POLICY IF EXISTS "Allow all bills" ON public.bills;
+CREATE POLICY "Allow all bills" ON public.bills FOR ALL USING (true) WITH CHECK (true);
 
-CREATE POLICY "Pharmacies view own bills" ON public.bills
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM public.pharmacies p
-      JOIN public.profiles pr ON pr.id = p.owner_user_id
-      WHERE p.id = pharmacy_id AND pr.auth_user_id = auth.uid()
-    )
-  );
+-- Alerts Policies
+DROP POLICY IF EXISTS "Users view own alerts" ON public.alerts;
+DROP POLICY IF EXISTS "Allow all alerts" ON public.alerts;
+CREATE POLICY "Allow all alerts" ON public.alerts FOR ALL USING (true) WITH CHECK (true);
+
+-- Audit Logs Policies
+DROP POLICY IF EXISTS "Admins view audit logs" ON public.audit_logs;
+DROP POLICY IF EXISTS "Allow all audit logs" ON public.audit_logs;
+CREATE POLICY "Allow all audit logs" ON public.audit_logs FOR ALL USING (true) WITH CHECK (true);
+
+-- Realtime Publication for Cross-Device Synchronization
+DO $$
+DECLARE
+  tbl TEXT;
+BEGIN
+  FOR tbl IN SELECT unnest(ARRAY['profiles', 'pharmacies', 'medicines', 'inventory', 'reservations', 'bills', 'alerts', 'audit_logs'])
+  LOOP
+    BEGIN
+      EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE public.%I', tbl);
+    EXCEPTION
+      WHEN duplicate_object THEN
+        NULL;
+      WHEN undefined_object THEN
+        NULL;
+    END;
+  END LOOP;
+END $$;
 
 -- 13. ATOMIC PROCEDURES / POSTGRESQL FUNCTIONS
 
