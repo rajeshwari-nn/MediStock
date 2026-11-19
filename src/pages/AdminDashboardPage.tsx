@@ -1114,7 +1114,7 @@ export const AdminDashboardPage: React.FC = () => {
             <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
               <h3 className="text-base font-bold text-slate-900 mb-2">System Analytics & Distribution</h3>
               <p className="text-xs text-slate-500 mb-6">
-                Comprehensive overview of central catalog medicines, verified formulations, active listings, and 48-hour reservation lifecycle.
+                Comprehensive overview of central catalog medicines, verified formulations, active listings, and 4-hour reservation lifecycle.
               </p>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 text-xs mb-6">
@@ -1149,12 +1149,12 @@ export const AdminDashboardPage: React.FC = () => {
                 </div>
 
                 <div className="p-3 bg-amber-50 rounded-xl border border-amber-200">
-                  <span className="font-bold text-amber-900 block mb-1">Active (Within 48h)</span>
+                  <span className="font-bold text-amber-900 block mb-1">Active (Within 4h)</span>
                   <span className="text-xl font-black text-amber-700">{stats.activeReservations}</span>
                 </div>
 
                 <div className="p-3 bg-rose-50 rounded-xl border border-rose-200">
-                  <span className="font-bold text-rose-900 block mb-1">Expired (48h limit)</span>
+                  <span className="font-bold text-rose-900 block mb-1">Expired (4h limit)</span>
                   <span className="text-xl font-black text-rose-700">{stats.expiredReservations}</span>
                 </div>
               </div>

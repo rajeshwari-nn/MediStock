@@ -26,9 +26,16 @@ import {
 // Helper for unique IDs
 export const generateId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return crypto.randomUUID();
+    try {
+      return crypto.randomUUID();
+    } catch (_) {}
   }
-  return 'id-' + Math.random().toString(36).substring(2, 11) + '-' + Date.now();
+  // Standard RFC4122 v4 UUID fallback for PostgreSQL compatibility
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 };
 
 export function toCloudMedicineId(id: string): string {
@@ -1094,7 +1101,18 @@ export const api = {
           .from('medicines')
           .select('*')
           .eq('catalogue_status', 'ACTIVE');
-        if (data && !error && data.length > 0) list = data;
+        if (data && !error && data.length > 0) {
+          list = data;
+          for (const med of data) {
+            const idx = localDB.medicines.findIndex(m => m.id === med.id);
+            if (idx !== -1) {
+              localDB.medicines[idx] = med;
+            } else {
+              localDB.medicines.push(med);
+            }
+          }
+          localDB.save();
+        }
       } catch (e) {
         console.warn('Supabase getMedicines fallback:', e);
       }
@@ -1221,14 +1239,20 @@ export const api = {
     if (isLiveSupabaseConfigured()) {
       try {
         const { error } = await supabase.from('medicines').insert([newMed]);
-        if (!error) return newMed;
+        if (error) console.warn('Supabase createMedicine error:', error);
       } catch (e) {
         console.warn('Supabase createMedicine fallback:', e);
       }
     }
 
-    localDB.medicines.push(newMed);
+    const existingIdx = localDB.medicines.findIndex(m => m.id === newMed.id);
+    if (existingIdx !== -1) {
+      localDB.medicines[existingIdx] = newMed;
+    } else {
+      localDB.medicines.push(newMed);
+    }
     localDB.save();
+    broadcastRealtimeEvent('INVENTORY_CHANGED', { medicineId: newMed.id });
     return newMed;
   },
 
@@ -1380,8 +1404,36 @@ export const api = {
   async getInventory(filter?: { pharmacyId?: string; medicineId?: string }): Promise<InventoryItem[]> {
     let list: InventoryItem[] = [];
 
+    // Comprehensive resolver ensuring newly created and predefined medicines are always found
+    const resolveMedicine = (mId: string, cloudMedsMap?: Map<string, Medicine>): Medicine | undefined => {
+      if (!mId) return undefined;
+      const normalized = fromCloudMedicineId(mId);
+      const cloud = toCloudMedicineId(mId);
+      return (
+        cloudMedsMap?.get(mId) ||
+        cloudMedsMap?.get(normalized) ||
+        cloudMedsMap?.get(cloud) ||
+        localDB.medicines.find(m => m.id === mId || m.id === normalized || m.id === cloud) ||
+        PREDEFINED_MEDICINES.find(m => m.id === mId || m.id === normalized || m.id === cloud)
+      );
+    };
+
     if (isLiveSupabaseConfigured()) {
       try {
+        const cloudMedsMap = new Map<string, Medicine>();
+        const { data: supaMeds } = await supabase.from('medicines').select('*').eq('catalogue_status', 'ACTIVE');
+        if (supaMeds && supaMeds.length > 0) {
+          for (const sm of supaMeds) {
+            cloudMedsMap.set(sm.id, sm);
+            cloudMedsMap.set(fromCloudMedicineId(sm.id), sm);
+            cloudMedsMap.set(toCloudMedicineId(sm.id), sm);
+            const idx = localDB.medicines.findIndex(m => m.id === sm.id);
+            if (idx === -1) localDB.medicines.push(sm);
+            else localDB.medicines[idx] = sm;
+          }
+          localDB.save();
+        }
+
         let query = supabase.from('inventory').select('*');
         if (filter?.pharmacyId) query = query.eq('pharmacy_id', filter.pharmacyId);
         if (filter?.medicineId) query = query.eq('medicine_id', toCloudMedicineId(filter.medicineId));
@@ -1390,10 +1442,11 @@ export const api = {
         if (data && !error && data.length > 0) {
           list = data.map((d: any) => {
             const mId = fromCloudMedicineId(d.medicine_id);
+            const medObj = resolveMedicine(d.medicine_id, cloudMedsMap) || resolveMedicine(mId, cloudMedsMap);
             return {
               ...d,
               medicine_id: mId,
-              medicine: localDB.medicines.find(m => m.id === mId) || PREDEFINED_MEDICINES.find(m => m.id === mId),
+              medicine: medObj,
               pharmacy: localDB.pharmacies.find(p => p.id === d.pharmacy_id),
             };
           });
@@ -1420,7 +1473,7 @@ export const api = {
 
     const populatedLocal = localList.map(item => ({
       ...item,
-      medicine: localDB.medicines.find(m => m.id === item.medicine_id) || PREDEFINED_MEDICINES.find(m => m.id === item.medicine_id),
+      medicine: resolveMedicine(item.medicine_id),
       pharmacy: localDB.pharmacies.find(p => p.id === item.pharmacy_id),
     }));
 
@@ -1597,9 +1650,11 @@ export const api = {
     if (actorPharmacyId && existingListing && existingListing.pharmacy_id !== actorPharmacyId) {
       throw new Error('Access denied: You cannot delete stock belonging to another pharmacy.');
     }
+    const pharmId = existingListing?.pharmacy_id || actorPharmacyId;
     if (isLiveSupabaseConfigured()) {
       try {
         await supabase.from('inventory').delete().eq('id', id);
+        broadcastRealtimeEvent('INVENTORY_CHANGED', { id, pharmacyId: pharmId });
         return { success: true };
       } catch (e) {
         console.warn('Supabase deleteInventoryItem fallback:', e);
@@ -1607,6 +1662,7 @@ export const api = {
     }
     localDB.inventory = localDB.inventory.filter(i => i.id !== id);
     localDB.save();
+    broadcastRealtimeEvent('INVENTORY_CHANGED', { id, pharmacyId: pharmId });
     return { success: true };
   },
 
@@ -1659,7 +1715,11 @@ export const api = {
       const pharmacy = approvedMap.get(inv.pharmacy_id);
       if (!pharmacy) continue;
 
-      const medicine = inv.medicine;
+      let medicine = inv.medicine;
+      if (!medicine) {
+        medicine = localDB.medicines.find(m => m.id === inv.medicine_id || toCloudMedicineId(m.id) === inv.medicine_id || fromCloudMedicineId(m.id) === inv.medicine_id)
+          || PREDEFINED_MEDICINES.find(m => m.id === inv.medicine_id || toCloudMedicineId(m.id) === inv.medicine_id);
+      }
       if (!medicine) continue;
 
       if (params.inStockOnly && inv.quantity <= 0) continue;
@@ -1845,7 +1905,7 @@ export const api = {
   // ----------------------------------------------------------------------------
 
   /**
-   * API 23: /api/reservations (POST) - Atomic Medicine Reservation & Stock Deduction with 48h Expiry
+   * API 23: /api/reservations (POST) - Atomic Medicine Reservation & Stock Deduction with 4-Hour Expiry Window
    */
   async createReservation(data: {
     userId: string;
@@ -1889,8 +1949,8 @@ export const api = {
 
     const totalPrice = Math.round(currentItem.price * data.quantity * 100) / 100;
     const now = new Date();
-    // FEATURE 7: Exactly 48-Hour Reservation Expiry Window
-    const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString();
+    // FEATURE 1: Exactly 4-Hour Reservation Expiry Window (starts from creation timestamp)
+    const expiresAt = new Date(now.getTime() + 4 * 60 * 60 * 1000).toISOString();
 
     const medicine = await this.getMedicineById(data.medicineId);
     const medName = medicine?.display_name || 'Medicine';
@@ -2038,9 +2098,9 @@ export const api = {
   },
 
   /**
-   * FEATURE 7 & 8: Automatic 48-Hour Reservation Expiry, 30-Min Pre-Expiry Reminders & Automatic Stock Restoration
+   * Automatic 4-Hour Reservation Expiry, 30-Min Pre-Expiry Reminders & Automatic Stock Restoration
    * - Sends 30-minute pre-expiry reminder to both customer and pharmacy.
-   * - If medicine is not picked up before end time, automatically restores pharmacy stock and alerts pharmacy.
+   * - If medicine is not picked up before end of 4 hours, automatically restores pharmacy stock and alerts pharmacy.
    */
   async checkAndExpireReservations(): Promise<number> {
     if (isLiveSupabaseConfigured()) {
@@ -2062,7 +2122,7 @@ export const api = {
 
       const expiresAtMs = res.expires_at 
         ? new Date(res.expires_at).getTime() 
-        : new Date(res.created_at).getTime() + (48 * 60 * 60 * 1000);
+        : new Date(res.created_at).getTime() + (4 * 60 * 60 * 1000);
 
       const timeLeftMs = expiresAtMs - nowTime;
 
@@ -2105,7 +2165,7 @@ export const api = {
         alertsAdded = true;
       }
 
-      // 2. AUTOMATIC STOCK RESTORATION WHEN CUSTOMER DID NOT PICK UP MEDICINE
+      // 2. AUTOMATIC STOCK RESTORATION WHEN CUSTOMER DID NOT PICK UP MEDICINE WITHIN 4 HOURS
       if (nowTime >= expiresAtMs) {
         res.status = 'EXPIRED';
         res.updated_at = new Date().toISOString();
@@ -2144,14 +2204,14 @@ export const api = {
 
         localDB.auditLogs.push({
           id: generateId(),
-          action: 'RESERVATION_AUTO_EXPIRED_48H',
+          action: 'RESERVATION_AUTO_EXPIRED_4H',
           entity_type: 'RESERVATIONS',
           entity_id: res.id,
           details: {
             medicine_id: res.medicine_id,
             pharmacy_id: res.pharmacy_id,
             quantity_restored: res.quantity,
-            reason: '48-hour customer collection window elapsed without pickup'
+            reason: '4-hour customer collection window elapsed without pickup'
           },
           created_at: new Date().toISOString()
         });
